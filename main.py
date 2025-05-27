@@ -1,13 +1,12 @@
 import cv2
 import time
-import threading # Added for thread lock
-import numpy as np # Added for frame manipulation
-import logging   # Added for logging
+import threading
+import numpy as np 
+import logging   
 from typing import Optional
 
-# Import GStreamer related classes from your Pipeline.py
-from Pipeline import GStreamerCameraPipeline, CameraType # Assuming Pipeline.py is in the same directory orPYTHONPATH
-from gi.repository import Gst # Added for GStreamer specific types like Gst.FlowReturn
+from Pipeline import GStreamerCameraPipeline, CameraType
+from gi.repository import Gst 
 
 
 Gst.init(None)
@@ -31,9 +30,9 @@ def get_user_preferences():
         "run_face_mesh": True,
         "run_hand_tracking": False,
         "run_object_detection": False,
-        "source_type": "webcam", # "webcam", "rtsp", "file", "test"
+        "source_type": "rtsp", # "webcam", "rtsp", "file", "test"
         "webcam_device": "/dev/video0",
-        "rtsp_url": 0 # "rtsp://admin:admin@192.168.1.206:1935"
+        "rtsp_url": "rtsp://admin:admin@192.168.1.206:1935"
     }
 
 def gst_sample_to_opencv_bgr(sample: Gst.Sample) -> Optional[np.ndarray]:
@@ -136,9 +135,10 @@ def main():
         source_params = {
             "url": user_prefs.get("rtsp_url"),
             "latency": 200, # Example, make configurable if needed
-            "protocols": "tcp" # Example
+            "protocols": "tcp", # Example
+            "do-rtsp-keep-alive": True # Explicitly set, though now defaults to True in Pipeline.py
         }
-        logger.info(f"Configuring GStreamer for RTSP: {source_params['url']}")
+        logger.info(f"Configuring GStreamer for RTSP: {source_params['url']} with keep-alive: {source_params.get('do-rtsp-keep-alive')}")
     elif source_type_pref == "file":
         gst_cam_type = CameraType.FILE
         source_params = {"filepath": user_prefs.get("video_file_path", "myvideo.mp4")} # Add "video_file_path" to prefs

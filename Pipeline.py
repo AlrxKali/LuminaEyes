@@ -119,16 +119,19 @@ class GStreamerCameraPipeline:
     def _build_rtsp_pipeline(self, params: Dict[str, Any], sink: str, processing: str) -> str:
         """Build pipeline string for RTSP source"""
         url = params.get("url", "")
-        latency = params.get("latency", 0)
+        latency = params.get("latency", 200) # Default latency if not provided
         protocols = params.get("protocols", "tcp")
-        
+        do_keep_alive = params.get("do-rtsp-keep-alive", True) # Added keep-alive parameter
+
         if not url:
             raise ValueError("RTSP URL is required")
-        
-        pipeline = f"rtspsrc location={url} latency={latency} protocols={protocols} ! "
-        pipeline += "rtph264depay ! h264parse ! avdec_h264 ! "
+
+        pipeline = f"rtspsrc location={url} latency={latency} protocols={protocols} "
+        if do_keep_alive: # Conditionally add the keep-alive property
+            pipeline += "do-rtsp-keep-alive=true "
+        pipeline += "! rtph264depay ! h264parse ! avdec_h264 ! "
         pipeline += "videoconvert ! "
-        
+
         if processing:
             pipeline += f"{processing} ! "
         
