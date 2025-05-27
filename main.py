@@ -1,42 +1,87 @@
 import cv2
 import time
 import threading
-import numpy as np 
-import logging   
-from typing import Optional
+import numpy as np
+import logging
+from typing import Optional, Dict, Any, Set
+import asyncio
+import websockets
+import json
+import base64
 
 from Pipeline import GStreamerCameraPipeline, CameraType
-from gi.repository import Gst 
-
+from gi.repository import Gst
 
 Gst.init(None)
 
-latest_frame = None
-frame_lock = threading.Lock()
-gst_pipeline_instance = None 
+# --- Global State ---
+latest_frame: Optional[np.ndarray] = None
+frame_lock = threading.Lock() # GStreamer runs in its own thread
+gst_pipeline_instance: Optional[GStreamerCameraPipeline] = None
+active_ai_pipelines = []
+clients: Set[websockets.WebSocketServerProtocol] = set()
+streaming_active = False
+ai_processing_task: Optional[asyncio.Task] = None
+main_event_loop: Optional[asyncio.AbstractEventLoop] = None
 
-# Configure basic logging for the main application
+# Default user preferences, can be updated via WebSocket
+user_preferences: Dict[str, Any] = {
+    "run_face_mesh": False,
+    "run_hand_tracking": False,
+    "run_object_detection": False,
+    "source_type": "webcam",  # "webcam", "rtsp", "file", "test"
+    "webcam_device": "/dev/video0",
+    "rtsp_url": "rtsp://admin:admin@192.168.1.206:1935",
+    "video_file_path": "myvideo.mp4",
+    # Add any other relevant preferences here
+}
+
+# Configure basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Import your detector classes
 from ai_pipelines.face_mesh import FaceMeshDetector
+# from ai_pipelines.hand_tracking import HandTracker # Placeholder
+# from ai_pipelines.object_detection import ObjectDetector # Placeholder
 
-# Placeholder for loading configurations (e.g., from a file, GUI, or command-line args)
-def get_user_preferences():
-    # Example: Enable face mesh by default, others disabled
-    # In a real app, this would read from a config file or CLI args
-    return {
-        "run_face_mesh": True,
-        "run_hand_tracking": False,
-        "run_object_detection": False,
-        "source_type": "rtsp", # "webcam", "rtsp", "file", "test"
-        "webcam_device": "/dev/video0",
-        "rtsp_url": "rtsp://admin:admin@192.168.1.206:1935"
-    }
+# --- WebSocket Handling ---
+async def register_client(websocket: websockets.WebSocketServerProtocol):
+    clients.add(websocket)
+    logger.info(f"Client connected: {websocket.remote_address}")
+    await notify_status(websocket) # Send current status to new client
 
+async def unregister_client(websocket: websockets.WebSocketServerProtocol):
+    clients.remove(websocket)
+    logger.info(f"Client disconnected: {websocket.remote_address}")
+
+async def notify_status(websocket: websockets.WebSocketServerProtocol, message_override: Optional[str] = None):
+    global streaming_active, user_preferences
+    if message_override:
+        status_message = message_override
+    elif not streaming_active:
+        status_message = "Stream stopped. Waiting for configuration."
+    elif not any(user_preferences.get(key) for key in ["run_face_mesh", "run_hand_tracking", "run_object_detection"]):
+        status_message = "Streaming video, but no AI models selected."
+    else:
+        active_models = [model_name for model_name, active in user_preferences.items() 
+                         if "run_" in model_name and active]
+        status_message = f"Streaming with models: {', '.join(active_models)}"
+    
+    try:
+        await websocket.send(json.dumps({"type": "status", "message": status_message, "config": user_preferences, "streaming_active": streaming_active}))
+    except websockets.ConnectionClosed:
+        pass # Client disconnected
+
+async def notify_status_to_all_clients(message_override: Optional[str] = None):
+    if clients: # Check if there are any clients
+        # Create a list of tasks to send status to all clients
+        tasks = [notify_status(client, message_override) for client in clients]
+        await asyncio.gather(*tasks, return_exceptions=True) # Handle potential errors during send
+
+
+# --- GStreamer and AI Processing ---
 def gst_sample_to_opencv_bgr(sample: Gst.Sample) -> Optional[np.ndarray]:
-    """Converts a Gst.Sample to an OpenCV (BGR) NumPy array."""
     buf = sample.get_buffer()
     caps = sample.get_caps()
     if not caps or not buf:
@@ -48,106 +93,148 @@ def gst_sample_to_opencv_bgr(sample: Gst.Sample) -> Optional[np.ndarray]:
     height = structure.get_value("height")
     width = structure.get_value("width")
 
-    # GStreamer appsink in the pipeline is set to BGR, so direct mapping.
-    # If it were RGB, conversion would be needed: frame = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
     if format_str != "BGR":
-        logger.warning(f"Expected BGR format from GStreamer, but got {format_str}. Colors might be incorrect.")
-        # Potentially add a conversion here if you often get other formats
-        # e.g., if format_str == "RGB":
-        #    # map buffer, create np.ndarray, then cv2.cvtColor(..., cv2.COLOR_RGB2BGR)
-
+        logger.warning(f"Expected BGR format, got {format_str}.")
+    
     success, map_info = buf.map(Gst.MapFlags.READ)
     if not success:
         logger.error("Failed to map GStreamer buffer")
+        buf.unmap(map_info) # Ensure unmap is called even on failure if map_info is valid
         return None
 
-    # Create a NumPy array from the buffer data
-    # This creates a view. A copy is essential if the frame is used after buf.unmap()
-    # or if the AI models modify the frame in place.
-    image = np.ndarray(
-        (height, width, 3),  # Assuming 3 channels for BGR (or RGB)
-        dtype=np.uint8,
-        buffer=map_info.data
-    )
-    
-    frame_copy = image.copy() # Make a copy to own the data
+    frame_copy = np.ndarray((height, width, 3), dtype=np.uint8, buffer=map_info.data).copy()
     buf.unmap(map_info)
     return frame_copy
 
 def on_new_frame_from_pipeline(appsink):
-    """Callback function for GStreamer appsink's 'new-sample' signal"""
     global latest_frame, frame_lock
     sample = appsink.emit("pull-sample")
     if sample:
         frame = gst_sample_to_opencv_bgr(sample)
         if frame is not None:
             with frame_lock:
-                latest_frame = frame
-    return Gst.FlowReturn.OK # Important for GStreamer to know processing was okay
+                latest_frame = frame.copy() # Ensure we have a distinct copy
+    return Gst.FlowReturn.OK
 
-def on_pipeline_error(error, debug_info):
-    logger.error(f"GStreamer Pipeline Error: {error}. Debug Info: {debug_info}")
+def on_pipeline_error(bus, message): # Modified to match Gst.Bus.connect("message::error", ...)
+    global main_event_loop
+    err, debug_info = message.parse_error()
+    logger.error(f"GStreamer Pipeline Error: {err}. Debug Info: {debug_info}")
+    if main_event_loop:
+        asyncio.run_coroutine_threadsafe(
+            notify_status_to_all_clients(f"GStreamer Pipeline Error: {err}"), 
+            main_event_loop
+        )
 
-def on_pipeline_eos():
+def on_pipeline_eos(bus, message): # Modified to match Gst.Bus.connect("message::eos", ...)
+    global main_event_loop
     logger.info("GStreamer Pipeline: End Of Stream.")
-    # You might want to signal the main loop to exit here
-    # For now, it will just log. The main loop continues until 'q' is pressed.
+    if main_event_loop:
+        asyncio.run_coroutine_threadsafe(
+            notify_status_to_all_clients("GStreamer Pipeline: End Of Stream."),
+            main_event_loop
+        )
+    # We might want to trigger a stop_video_streaming_loop here if EOS means the source is finished
+    # For now, it depends on the source type. File sources will EOS, RTSP/webcam might not.
 
-def main():
-    global latest_frame, frame_lock, gst_pipeline_instance
-    user_prefs = get_user_preferences()
-    active_ai_pipelines = []
 
-    cv2.namedWindow("Combined Output", cv2.WINDOW_AUTOSIZE)
-    cv2.waitKey(1)
+async def process_and_broadcast_frames():
+    global latest_frame, frame_lock, streaming_active, user_preferences, active_ai_pipelines
+    pTime = 0
+
+    while streaming_active:
+        current_frame_for_processing = None
+        with frame_lock:
+            if latest_frame is not None:
+                current_frame_for_processing = latest_frame.copy()
+        
+        if current_frame_for_processing is not None:
+            processed_frame = current_frame_for_processing
+            all_ai_data = {}
+
+            if active_ai_pipelines:
+                for pipeline_idx, ai_pipeline in enumerate(active_ai_pipelines):
+                    # Assuming process_frame or findFaceMesh returns (image, data)
+                    # And that these methods don't block for too long
+                    if hasattr(ai_pipeline, 'process_frame'):
+                        processed_frame, data = ai_pipeline.process_frame(processed_frame)
+                    elif hasattr(ai_pipeline, 'findFaceMesh'): # Legacy/alternative
+                        processed_frame, data = ai_pipeline.findFaceMesh(processed_frame)
+                    else:
+                        data = {} # No specific data processing method found
+                    all_ai_data[f"{ai_pipeline.__class__.__name__}_{pipeline_idx}"] = data
+
+            # Encode frame to JPEG
+            _, buffer = cv2.imencode('.jpg', processed_frame)
+            jpg_as_text = base64.b64encode(buffer).decode('utf-8')
+
+            # Send frame and AI data to all clients
+            if clients:
+                message = json.dumps({"type": "video_frame", "frame": jpg_as_text, "ai_data": all_ai_data, "timestamp": time.time()})
+                # Create a list of tasks to send frame to all clients
+                tasks = [client.send(message) for client in clients]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for i, res in enumerate(results):
+                    if isinstance(res, Exception):
+                        logger.warning(f"Failed to send frame to client {list(clients)[i].remote_address}: {res}")
+
+
+            # FPS calculation (optional, can be done on client-side too)
+            cTime = time.time()
+            fps = 1 / (cTime - pTime) if (cTime - pTime) > 0 else 0
+            pTime = cTime
+            # logger.info(f"FPS: {int(fps)}") # Logging FPS can be verbose
+
+            await asyncio.sleep(0.01) # Adjust for desired frame rate / responsiveness
+        else:
+            await asyncio.sleep(0.005) # Wait briefly if no new frame
+
+async def start_video_streaming_loop(prefs: Dict[str, Any]):
+    global gst_pipeline_instance, streaming_active, active_ai_pipelines, ai_processing_task, user_preferences
+
+    if streaming_active:
+        logger.info("Streaming is already active. Stopping first.")
+        await stop_video_streaming_loop() # Ensure clean state
+
+    user_preferences.update(prefs) # Update global prefs with new settings
+    logger.info(f"Starting video stream with preferences: {user_preferences}")
+    active_ai_pipelines.clear()
 
     # Initialize selected AI pipelines
-    if user_prefs.get("run_face_mesh"):
+    if user_preferences.get("run_face_mesh"):
         logger.info("Initializing Face Mesh Detector...")
-        active_ai_pipelines.append(FaceMeshDetector(maxFaces=2))
-    
-    # if user_prefs.get("run_hand_tracking"):
-    #     logger.info("Initializing Hand Tracker...")
+        active_ai_pipelines.append(FaceMeshDetector(maxFaces=2)) # Example params
+    # Add other AI pipelines based on user_preferences
+    # if user_preferences.get("run_hand_tracking"):
     #     active_ai_pipelines.append(HandTracker())
-        
-    # if user_prefs.get("run_object_detection"):
-    #     logger.info("Initializing Object Detector...")
+    # if user_preferences.get("run_object_detection"):
     #     active_ai_pipelines.append(ObjectDetector())
 
     if not active_ai_pipelines:
-        logger.warning("No AI pipelines selected. Video will be shown without AI processing.")
-        # We can still run the GStreamer pipeline to just display video
+        logger.warning("No AI pipelines selected. Video will be streamed without AI processing.")
 
-    # --- GStreamer Pipeline Setup ---
-    gst_pipeline_instance = GStreamerCameraPipeline(name="main_video_feed")
-    gst_pipeline_instance.set_callbacks(on_error=on_pipeline_error, on_eos=on_pipeline_eos)
+    gst_pipeline_instance = GStreamerCameraPipeline(name="websocket_video_feed")
+    
+    # GStreamer pipeline error and EOS are now connected with modified handlers
+    gst_pipeline_instance.set_callbacks(on_error=None, on_eos=None) # Callbacks set directly on bus messages now
 
-    source_type_pref = user_prefs.get("source_type", "webcam").lower()
+    source_type_pref = user_preferences.get("source_type", "webcam").lower()
     source_params = {}
-    gst_cam_type = CameraType.WEBCAM # Default
+    gst_cam_type = CameraType.WEBCAM
 
     if source_type_pref == "webcam":
         gst_cam_type = CameraType.WEBCAM
-        source_params = {"device": user_prefs.get("webcam_device", "/dev/video0")}
-        logger.info(f"Configuring GStreamer for Webcam: {source_params['device']}")
+        source_params = {"device": user_preferences.get("webcam_device", "/dev/video0")}
     elif source_type_pref == "rtsp":
         gst_cam_type = CameraType.RTSP
         source_params = {
-            "url": user_prefs.get("rtsp_url"),
-            "latency": 200, # Example, make configurable if needed
-            "protocols": "tcp", # Example
-            "do-rtsp-keep-alive": True # Explicitly set, though now defaults to True in Pipeline.py
+            "url": user_preferences.get("rtsp_url"), "latency": 200, "protocols": "tcp", "do-rtsp-keep-alive": True
         }
-        logger.info(f"Configuring GStreamer for RTSP: {source_params['url']} with keep-alive: {source_params.get('do-rtsp-keep-alive')}")
     elif source_type_pref == "file":
         gst_cam_type = CameraType.FILE
-        source_params = {"filepath": user_prefs.get("video_file_path", "myvideo.mp4")} # Add "video_file_path" to prefs
-        logger.info(f"Configuring GStreamer for File: {source_params['filepath']}")
-    # Add other source types (TEST, CUSTOM) as needed
+        source_params = {"filepath": user_preferences.get("video_file_path", "myvideo.mp4")}
+    # Add other source types as needed
 
-    # We will define an appsink directly in the pipeline string passed to build_pipeline.
-    # This appsink will provide frames to our `on_new_frame_from_pipeline` callback.
-    # The format BGR is generally what OpenCV expects.
     appsink_name = "pythonsink"
     appsink_pipeline_config = (
         f"appsink name={appsink_name} emit-signals=true "
@@ -158,75 +245,153 @@ def main():
         gst_pipeline_instance.build_pipeline(
             camera_type=gst_cam_type,
             source_params=source_params,
-            sink_type=appsink_pipeline_config, # Key change: sink_type IS our appsink string
-            processing_elements="" # e.g., "videoscale ! video/x-raw,width=320,height=240"
+            sink_type=appsink_pipeline_config,
+            processing_elements=""
         )
-
-        # Get the appsink element by name and connect the callback
+        
         appsink_el = gst_pipeline_instance.pipeline.get_by_name(appsink_name)
         if not appsink_el:
-            logger.error(f"Failed to get appsink element '{appsink_name}' from pipeline. Check pipeline construction.")
+            logger.error(f"Failed to get appsink element '{appsink_name}'.")
+            await notify_status_to_all_clients(f"Error: Failed to get appsink from GStreamer pipeline.")
             return
         appsink_el.connect("new-sample", on_new_frame_from_pipeline)
+
+        # Connect bus messages for error and EOS
+        bus = gst_pipeline_instance.pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message::error", on_pipeline_error)
+        bus.connect("message::eos", on_pipeline_eos)
+
+
+        gst_pipeline_instance.start() # This starts the GStreamer GLib main loop in a separate thread
+        streaming_active = True
+        logger.info("GStreamer pipeline started for WebSocket streaming.")
         
-        gst_pipeline_instance.start()
-        logger.info("GStreamer pipeline started.")
+        # Start the asyncio task for processing frames and broadcasting via WebSocket
+        ai_processing_task = asyncio.create_task(process_and_broadcast_frames())
+        await notify_status_to_all_clients()
 
     except Exception as e:
         logger.error(f"Failed to initialize or start GStreamer pipeline: {e}")
+        streaming_active = False
+        await notify_status_to_all_clients(f"Error starting GStreamer: {e}")
+
+
+async def stop_video_streaming_loop():
+    global gst_pipeline_instance, streaming_active, ai_processing_task, active_ai_pipelines, latest_frame
+
+    logger.info("Attempting to stop video stream...")
+    if not streaming_active and not gst_pipeline_instance and not ai_processing_task:
+        logger.info("Stream already stopped or not initialized.")
+        await notify_status_to_all_clients("Stream is not active.")
         return
-    # --- End GStreamer Pipeline Setup ---
 
-    pTime = 0
+    streaming_active = False # Signal the processing loop to stop
 
+    if ai_processing_task:
+        logger.info("Cancelling AI processing task...")
+        ai_processing_task.cancel()
+        try:
+            await ai_processing_task
+        except asyncio.CancelledError:
+            logger.info("AI processing task cancelled successfully.")
+        except Exception as e:
+            logger.error(f"Exception while cancelling AI task: {e}")
+        ai_processing_task = None
+
+    if gst_pipeline_instance and gst_pipeline_instance.is_playing:
+        logger.info("Stopping GStreamer pipeline...")
+        gst_pipeline_instance.stop() # This should also stop its internal loop_thread
+        logger.info("GStreamer pipeline stop command issued.")
+    
+    gst_pipeline_instance = None
+    active_ai_pipelines.clear()
+    with frame_lock: # Clear the last frame
+        latest_frame = None
+    
+    logger.info("Video stream stopped.")
+    await notify_status_to_all_clients("Stream stopped.")
+
+
+async def serve_websocket_commands(websocket: websockets.WebSocketServerProtocol, path: str):
+    global user_preferences
+    await register_client(websocket)
     try:
-        while True:
-            current_frame_for_processing = None
-            with frame_lock:
-                if latest_frame is not None:
-                    # Make a copy for AI processing to avoid race conditions if GStreamer updates latest_frame
-                    current_frame_for_processing = latest_frame.copy()
-            
-            if current_frame_for_processing is not None:
-                processed_frame = current_frame_for_processing # This will be modified by AI pipelines
-                all_data = {} # To store data from all pipelines for this frame
+        async for message_str in websocket:
+            try:
+                message = json.loads(message_str)
+                command = message.get("command")
+                config = message.get("config", {})
 
-                if active_ai_pipelines: # Only process if AI pipelines are active
-                    for pipeline_idx, ai_pipeline in enumerate(active_ai_pipelines):
-                        if hasattr(ai_pipeline, 'process_frame'):
-                            processed_frame, data = ai_pipeline.process_frame(processed_frame)
-                            all_data[f"ai_pipeline_{pipeline_idx}_{ai_pipeline.__class__.__name__}"] = data
-                        elif hasattr(ai_pipeline, 'findFaceMesh'): # Legacy support for findFaceMesh
-                            processed_frame, data = ai_pipeline.findFaceMesh(processed_frame)
-                            all_data[f"ai_pipeline_{pipeline_idx}_{ai_pipeline.__class__.__name__}"] = data
-                
-                # Calculate and display FPS
-                cTime = time.time()
-                fps = 1 / (cTime - pTime) if (cTime - pTime) > 0 else 0
-                pTime = cTime
-                cv2.putText(processed_frame, f'FPS: {int(fps)} ({processed_frame.shape[1]}x{processed_frame.shape[0]})', 
-                            (20, 70), cv2.FONT_HERSHEY_PLAIN, 2, (0, 255, 0), 2)
+                logger.info(f"Received command: {command} with config: {config if config else 'No config'}")
 
-                cv2.imshow("Combined Output", processed_frame)
-            else:
-                # Optional: Add a small sleep if no frame yet, to prevent busy-waiting in main thread
-                # However, GStreamer callback should provide frames. If it's too slow, this might indicate
-                # an issue with the GStreamer pipeline or system performance.
-                time.sleep(0.001) # 1 ms sleep
+                if command == "start_stream":
+                    # Update user_preferences with received config
+                    # Sanitize/validate config as needed
+                    user_preferences.update(config)
+                    await start_video_streaming_loop(user_preferences)
+                elif command == "stop_stream":
+                    await stop_video_streaming_loop()
+                elif command == "update_config": # For changing models without full stop/start
+                    user_preferences.update(config)
+                    logger.info(f"User preferences updated to: {user_preferences}")
+                    # If streaming, potentially restart with new config or update on the fly
+                    if streaming_active:
+                        logger.info("Config updated while streaming. Restarting stream with new config.")
+                        await start_video_streaming_loop(user_preferences) # Simple restart for now
+                    else:
+                       await notify_status_to_all_clients("Configuration updated. Stream is stopped.")
+                elif command == "get_status":
+                    await notify_status(websocket)
+                else:
+                    logger.warning(f"Unknown command received: {command}")
+                    await websocket.send(json.dumps({"type": "error", "message": f"Unknown command: {command}"}))
 
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                logger.info("'q' pressed, exiting...")
-                break
-            # Add other key handling if needed
-
+            except json.JSONDecodeError:
+                logger.error("Invalid JSON received from client.")
+                await websocket.send(json.dumps({"type": "error", "message": "Invalid JSON format"}))
+            except Exception as e:
+                logger.error(f"Error processing command: {e}")
+                await websocket.send(json.dumps({"type": "error", "message": f"Error processing command: {str(e)}"}))
+    except websockets.exceptions.ConnectionClosedOK:
+        logger.info(f"Client {websocket.remote_address} disconnected normally.")
+    except websockets.exceptions.ConnectionClosedError as e:
+        logger.error(f"Client {websocket.remote_address} connection closed with error: {e}")
     finally:
-        logger.info("Shutting down...")
-        if gst_pipeline_instance and gst_pipeline_instance.is_playing:
-            logger.info("Stopping GStreamer pipeline...")
-            gst_pipeline_instance.stop()
-        cv2.destroyAllWindows()
-        logger.info("Application terminated.")
+        await unregister_client(websocket)
+
+async def main_async():
+    global main_event_loop
+    # Ensure Gst is initialized (already done globally, but good practice if moved)
+    # Gst.init(None) 
+    
+    main_event_loop = asyncio.get_running_loop()
+
+    host = "0.0.0.0" # Listen on all available interfaces
+    port = 8765       # Standard WebSocket port, change if needed
+    
+    logger.info(f"Starting WebSocket server on ws://{host}:{port}")
+    
+    server = await websockets.serve(serve_websocket_commands, host, port)
+    
+    try:
+        await server.wait_closed() # Keep the server running
+    except KeyboardInterrupt:
+        logger.info("Server shutting down on KeyboardInterrupt...")
+    finally:
+        # Graceful shutdown of streaming if active
+        if streaming_active:
+            logger.info("Shutting down active stream...")
+            await stop_video_streaming_loop()
+        
+        server.close()
+        await server.wait_closed() # Ensure server fully closed
+        logger.info("WebSocket server shut down.")
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main_async())
+    except KeyboardInterrupt:
+        logger.info("Application terminated by user.")
+    except Exception as e:
+        logger.critical(f"Unhandled exception in main: {e}", exc_info=True)
