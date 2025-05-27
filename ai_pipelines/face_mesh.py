@@ -47,6 +47,11 @@ class FaceMeshDetector():
                 faces.append(face)
         return img, faces
 
+    def close(self):
+        if hasattr(self, 'faceMesh') and self.faceMesh:
+            print("Closing FaceMeshDetector's MediaPipe FaceMesh object.")
+            self.faceMesh.close()
+
 
 def main():
     cap = cv2.VideoCapture(0)

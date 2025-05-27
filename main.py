@@ -141,53 +141,83 @@ def on_pipeline_eos(bus, message): # Modified to match Gst.Bus.connect("message:
 async def process_and_broadcast_frames():
     global latest_frame, frame_lock, streaming_active, user_preferences, active_ai_pipelines
     pTime = 0
+    logger.info("AI Processing & Broadcast task started.")
 
-    while streaming_active:
-        current_frame_for_processing = None
-        with frame_lock:
-            if latest_frame is not None:
-                current_frame_for_processing = latest_frame.copy()
-        
-        if current_frame_for_processing is not None:
-            processed_frame = current_frame_for_processing
-            all_ai_data = {}
+    try:
+        while streaming_active:
+            current_frame_for_processing = None
+            with frame_lock:
+                if latest_frame is not None:
+                    current_frame_for_processing = latest_frame.copy()
+            
+            if current_frame_for_processing is not None:
+                # logger.debug(f"Processing frame. AI pipelines active: {len(active_ai_pipelines)}") # Uncomment for very verbose logging
+                processed_frame = current_frame_for_processing
+                all_ai_data = {}
 
-            if active_ai_pipelines:
-                for pipeline_idx, ai_pipeline in enumerate(active_ai_pipelines):
-                    # Assuming process_frame or findFaceMesh returns (image, data)
-                    # And that these methods don't block for too long
-                    if hasattr(ai_pipeline, 'process_frame'):
-                        processed_frame, data = ai_pipeline.process_frame(processed_frame)
-                    elif hasattr(ai_pipeline, 'findFaceMesh'): # Legacy/alternative
-                        processed_frame, data = ai_pipeline.findFaceMesh(processed_frame)
-                    else:
-                        data = {} # No specific data processing method found
-                    all_ai_data[f"{ai_pipeline.__class__.__name__}_{pipeline_idx}"] = data
+                if active_ai_pipelines:
+                    for pipeline_idx, ai_pipeline in enumerate(active_ai_pipelines):
+                        try:
+                            logger.info(f"Attempting to apply AI pipeline: {ai_pipeline.__class__.__name__}")
+                            if hasattr(ai_pipeline, 'process_frame'):
+                                processed_frame, data = ai_pipeline.process_frame(processed_frame)
+                            elif hasattr(ai_pipeline, 'findFaceMesh'): # Legacy/alternative
+                                processed_frame, data = ai_pipeline.findFaceMesh(processed_frame)
+                            else:
+                                data = {} # No specific data processing method found
+                            all_ai_data[f"{ai_pipeline.__class__.__name__}_{pipeline_idx}"] = data
+                            logger.info(f"Successfully applied AI pipeline: {ai_pipeline.__class__.__name__}")
+                        except Exception as e_ai:
+                            logger.error(f"Error during AI processing with {ai_pipeline.__class__.__name__}: {e_ai}", exc_info=True)
+                            # Send error info within ai_data for this pipeline
+                            all_ai_data[f"{ai_pipeline.__class__.__name__}_{pipeline_idx}"] = {"error": str(e_ai)}
+                            # Decide if you want to continue sending the frame or skip
+                            # For now, we continue with the frame possibly unprocessed by this failing AI pipeline
+                else:
+                    # logger.debug("No AI pipelines active, sending raw frame.") # Uncomment for very verbose logging
+                    pass # No AI processing needed
 
-            # Encode frame to JPEG
-            _, buffer = cv2.imencode('.jpg', processed_frame)
-            jpg_as_text = base64.b64encode(buffer).decode('utf-8')
+                # Encode frame to JPEG
+                encode_success, buffer = cv2.imencode('.jpg', processed_frame)
+                if not encode_success:
+                    logger.error("Failed to encode frame to JPEG.")
+                    await asyncio.sleep(0.01) # Avoid busy loop if encoding fails
+                    continue
+                
+                jpg_as_text = base64.b64encode(buffer).decode('utf-8')
 
-            # Send frame and AI data to all clients
-            if clients:
-                message = json.dumps({"type": "video_frame", "frame": jpg_as_text, "ai_data": all_ai_data, "timestamp": time.time()})
-                # Create a list of tasks to send frame to all clients
-                tasks = [client.send(message) for client in clients]
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                for i, res in enumerate(results):
-                    if isinstance(res, Exception):
-                        logger.warning(f"Failed to send frame to client {list(clients)[i].remote_address}: {res}")
+                # Send frame and AI data to all clients
+                if clients:
+                    message = json.dumps({"type": "video_frame", "frame": jpg_as_text, "ai_data": all_ai_data, "timestamp": time.time()})
+                    tasks = [client.send(message) for client in clients]
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+                    for i, res in enumerate(results):
+                        if isinstance(res, Exception):
+                            # Safely get client address for logging
+                            client_list = list(clients)
+                            client_addr = client_list[i].remote_address if i < len(client_list) else "unknown_client"
+                            logger.warning(f"Failed to send frame to client {client_addr}: {res}")
+                
+                cTime = time.time()
+                fps = 1 / (cTime - pTime) if (cTime - pTime) > 0 else 0
+                pTime = cTime
+                # logger.info(f"FPS: {int(fps)}") # Logging FPS can be verbose
 
-
-            # FPS calculation (optional, can be done on client-side too)
-            cTime = time.time()
-            fps = 1 / (cTime - pTime) if (cTime - pTime) > 0 else 0
-            pTime = cTime
-            # logger.info(f"FPS: {int(fps)}") # Logging FPS can be verbose
-
-            await asyncio.sleep(0.01) # Adjust for desired frame rate / responsiveness
-        else:
-            await asyncio.sleep(0.005) # Wait briefly if no new frame
+                await asyncio.sleep(0.01) # Adjust for desired frame rate / responsiveness
+            else:
+                # logger.debug("No new frame from GStreamer, sleeping briefly.") # Uncomment for very verbose logging
+                await asyncio.sleep(0.005) # Wait briefly if no new frame
+    except asyncio.CancelledError:
+        logger.info("AI Processing & Broadcast task explicitly cancelled.")
+        raise # Re-raise CancelledError is important for proper task cleanup
+    except Exception as e_loop:
+        logger.error(f"Fatal exception in process_and_broadcast_frames loop: {e_loop}", exc_info=True)
+        # This task will terminate. Consider notifying clients or attempting a graceful shutdown of the stream.
+        await notify_status_to_all_clients(f"Critical Error: AI processing loop failed: {e_loop}")
+        # global streaming_active # Can't assign to global here directly for stopping
+        # Consider calling stop_video_streaming_loop, but need to be careful about re-entrancy
+    finally:
+        logger.info("AI Processing & Broadcast task finished.")
 
 async def start_video_streaming_loop(prefs: Dict[str, Any]):
     global gst_pipeline_instance, streaming_active, active_ai_pipelines, ai_processing_task, user_preferences
@@ -305,7 +335,17 @@ async def stop_video_streaming_loop():
         logger.info("GStreamer pipeline stop command issued.")
     
     gst_pipeline_instance = None
+    
+    logger.info("Closing active AI pipelines...")
+    for ai_pipe in active_ai_pipelines:
+        if hasattr(ai_pipe, 'close'):
+            try:
+                logger.info(f"Calling close() on {ai_pipe.__class__.__name__}")
+                ai_pipe.close()
+            except Exception as e_close:
+                logger.error(f"Error closing AI pipeline {ai_pipe.__class__.__name__}: {e_close}")
     active_ai_pipelines.clear()
+
     with frame_lock: # Clear the last frame
         latest_frame = None
     
